@@ -18,4 +18,5 @@ ignore = ["S101", "S608"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = ["aws: hits real AWS; needs ACB_AWS_TESTS=1 and credentials"]
