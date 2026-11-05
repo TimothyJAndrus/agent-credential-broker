@@ -1,0 +1,25 @@
+# Example policy. Keys here are demo values; generate real ones with
+#   python -m acb.cli hash-key
+# and store only the sha256 in this file.
+version: 1
+max_ttl_seconds: 3600            # global ceiling; rules can only lower it
+
+sts:                             # optional; needed only for rules with backend: sts
+  role_arn: arn:aws:iam::123456789012:role/acb-sts-ceiling
+  region: us-west-2
+
+approvers:
+  tim: {key_sha256: 2fd89efd7e2cd87f7f5df2038bf200b0f66e1dd460172a80283b38ada74c25fc}
+
+agents:
+  support-bot:
+    key_sha256: 8cfbbed0d818a803eddf3db2193bd492460b2db9999d03775a023dd8f90d04a6
+    rules:
+      # Read the knowledge base on its own, 10 minutes at a time.
+      - {action: read,  resource: "s3://acme-data/kb/*",     decision: allow,   max_ttl_seconds: 600}
+      # Anything that leaves the building waits for a human.
+      - {action: write, resource: "s3://acme-data/outbox/*", decision: approve, max_ttl_seconds: 300}
+      # Deny wins over any allow it overlaps, including wildcard requests that would reach it.
+      - {action: read,  resource: "s3://acme-data/kb/internal/*", decision: deny}
+      # Real AWS credentials, narrowed per grant by an STS session policy (min 900 s).
+      - {action: read,  resource: "s3://acme-live/feeds/*", decision: allow, backend: sts, max_ttl_seconds: 900}

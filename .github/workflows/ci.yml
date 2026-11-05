@@ -1,0 +1,23 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-dev.txt cfn-lint
+      - run: ruff check .
+      - run: ruff format --check .
+      - name: Unit + trap evals (live AWS tests skip without ACB_AWS_TESTS=1)
+        run: pytest -v
+      - run: python -m acb.cli check-policy policy.example.yaml
+      - run: cfn-lint infra/sts-backend.yaml
+      - name: Demo runs end to end
+        run: python scripts/demo.py
+      - name: Dependency audit (fails on any known vulnerability)
+        run: pip-audit -r requirements.txt

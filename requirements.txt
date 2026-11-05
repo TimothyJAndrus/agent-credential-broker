@@ -1,0 +1,8 @@
+fastapi==0.162.0
+starlette==1.10.0
+uvicorn[standard]==0.54.0
+pydantic==2.14.2
+PyJWT[crypto]==2.15.1
+cryptography==50.0.2
+PyYAML==6.0.3
+boto3==1.43.124

@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  agent-credential-broker STS backend: a ceiling role the broker assumes with
+  per-grant session policies, plus a demo bucket. The role's own policy is the
+  hard upper bound; session policies only narrow it.
+
+Parameters:
+  BrokerPrincipalArn:
+    Type: String
+    Description: IAM user or role ARN the broker runs as. Only it may assume the ceiling role.
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:(user|role)/.+$"
+
+Resources:
+  DemoBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "acb-demo-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expire-noncurrent, Status: Enabled, NoncurrentVersionExpiration: {NoncurrentDays: 7}}
+
+  DemoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DemoBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt DemoBucket.Arn, !Sub "${DemoBucket.Arn}/*"]
+            Condition: {Bool: {"aws:SecureTransport": "false"}}
+
+  CeilingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ceiling"
+      Description: Upper bound for every credential the broker hands an agent.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: BrokerOnly
+            Effect: Allow
+            Principal: {AWS: !Ref "AWS::AccountId"}
+            Action: ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]
+            Condition:
+              ArnEquals: {"aws:PrincipalArn": !Ref BrokerPrincipalArn}
+          - Sid: OnlyBrokerTagKeys
+            Effect: Deny
+            Principal: {AWS: !Ref "AWS::AccountId"}
+            Action: "sts:TagSession"
+            Condition:
+              "ForAnyValue:StringNotEquals": {"aws:TagKeys": ["acb_grant", "acb_agent"]}
+          - Sid: SourceIdentityRequired
+            Effect: Deny
+            Principal: {AWS: !Ref "AWS::AccountId"}
+            Action: "sts:AssumeRole"
+            Condition:
+              "Null": {"sts:SourceIdentity": "true"}
+      Policies:
+        - PolicyName: ceiling
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadFeeds
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DemoBucket.Arn}/feeds/*"
+              - Sid: WriteOutbox
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${DemoBucket.Arn}/outbox/*"
+              - Sid: ListFeedsAndOutbox
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DemoBucket.Arn
+                Condition: {StringLike: {"s3:prefix": ["feeds/*", "outbox/*"]}}
+
+  BrokerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-broker"
+      Description: Minimum the broker itself needs. Attach to the broker principal in production.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumeCeiling
+            Effect: Allow
+            Action: ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]
+            Resource: !GetAtt CeilingRole.Arn
+          # IAM has no condition key for the inline policy's name, so this can't be
+          # narrowed to "acb-revocations" only. The broker could therefore add an Allow
+          # to the ceiling role. Mitigation: the ceiling role is the only resource, and
+          # a permissions boundary on it (production TODO) caps what any inline policy grants.
+          - Sid: ManageRevocationPolicy
+            Effect: Allow
+            Action: ["iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:GetRolePolicy"]
+            Resource: !GetAtt CeilingRole.Arn
+
+Outputs:
+  CeilingRoleArn: {Value: !GetAtt CeilingRole.Arn}
+  DemoBucketName: {Value: !Ref DemoBucket}
+  BrokerPolicyArn: {Value: !Ref BrokerPolicy}
