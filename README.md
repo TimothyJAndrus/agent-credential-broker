@@ -119,7 +119,7 @@ v0.1 listed five limits. Status:
 | v0.1 limit | v0.2 |
 |---|---|
 | Broker's IAM permission could add an `Allow` to the ceiling role | **Fixed.** Permissions boundary + explicit denies on the broker; proven live with the broker's own credentials |
-| STS revocation not instant | **Narrowed, not eliminated.** IAM propagation is AWS's, not ours: measured 8.6–55 s. The broker now *confirms* each revocation with a canary and records the time, has a `TokenIssueTime` fallback when the list is too big, and the 900 s maximum lifetime remains the backstop. |
+| STS revocation not instant | **Narrowed, not eliminated.** IAM propagation is AWS's, not ours: measured 8.6–55 s. The broker now *confirms* each revocation with a canary and records the time, has a `TokenIssueTime` fallback when the list is too big, and short credential lifetimes remain the backstop (STS sessions can be as short as 900 s; set rule TTLs accordingly). |
 | Single process | **Fixed.** PostgreSQL store, shared audit chain, and advisory locks; proven with 3 racing instances |
 | API keys for agents | **Fixed.** AWS IAM and OIDC auth; API keys are optional and for development |
 | S3 only, three actions | **Still true.** Adding a resource type means adding a scope grammar and a session-policy builder. Next. |
