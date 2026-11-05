@@ -46,12 +46,46 @@ Resources:
             Resource: [!GetAtt DemoBucket.Arn, !Sub "${DemoBucket.Arn}/*"]
             Condition: {Bool: {"aws:SecureTransport": "false"}}
 
+  # The boundary IS the ceiling. Anything any identity policy on the role allows
+  # (including an inline policy a compromised broker writes) is cut to this.
+  CeilingBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-boundary"
+      Description: Permissions boundary for the ceiling role. The broker cannot modify or detach it.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadFeeds
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "${DemoBucket.Arn}/feeds/*"
+          - Sid: WriteOutbox
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub "${DemoBucket.Arn}/outbox/*"
+          - Sid: ListFeedsAndOutbox
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt DemoBucket.Arn
+            Condition: {StringLike: {"s3:prefix": ["feeds/*", "outbox/*"]}}
+          - Sid: RevocationProbe
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub "${DemoBucket.Arn}/acb-probe/*"
+          - Sid: RevocationProbeList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt DemoBucket.Arn
+            Condition: {StringLike: {"s3:prefix": ["acb-probe/*"]}}
+
   CeilingRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${AWS::StackName}-ceiling"
       Description: Upper bound for every credential the broker hands an agent.
       MaxSessionDuration: 3600
+      PermissionsBoundary: !Ref CeilingBoundary
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -60,7 +94,10 @@ Resources:
             Principal: {AWS: !Ref "AWS::AccountId"}
             Action: ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]
             Condition:
-              ArnEquals: {"aws:PrincipalArn": !Ref BrokerPrincipalArn}
+              ArnEquals:
+                "aws:PrincipalArn":
+                  - !Ref BrokerPrincipalArn
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-broker-test"
           - Sid: OnlyBrokerTagKeys
             Effect: Deny
             Principal: {AWS: !Ref "AWS::AccountId"}
@@ -91,6 +128,15 @@ Resources:
                 Action: s3:ListBucket
                 Resource: !GetAtt DemoBucket.Arn
                 Condition: {StringLike: {"s3:prefix": ["feeds/*", "outbox/*"]}}
+              - Sid: RevocationProbe
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${DemoBucket.Arn}/acb-probe/*"
+              - Sid: RevocationProbeList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DemoBucket.Arn
+                Condition: {StringLike: {"s3:prefix": ["acb-probe/*"]}}
 
   BrokerPolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -104,16 +150,60 @@ Resources:
             Effect: Allow
             Action: ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]
             Resource: !GetAtt CeilingRole.Arn
-          # IAM has no condition key for the inline policy's name, so this can't be
-          # narrowed to "acb-revocations" only. The broker could therefore add an Allow
-          # to the ceiling role. Mitigation: the ceiling role is the only resource, and
-          # a permissions boundary on it (production TODO) caps what any inline policy grants.
+          # IAM has no condition key for an inline policy's name, so this can't be narrowed
+          # to "acb-revocations". A compromised broker could write an Allow here; the
+          # permissions boundary above caps it, and the broker can't touch the boundary.
           - Sid: ManageRevocationPolicy
             Effect: Allow
             Action: ["iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:GetRolePolicy"]
             Resource: !GetAtt CeilingRole.Arn
+          - Sid: NeverTouchBoundaryOrTrust
+            Effect: Deny
+            Action:
+              - iam:DeleteRolePermissionsBoundary
+              - iam:PutRolePermissionsBoundary
+              - iam:UpdateAssumeRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:CreatePolicyVersion
+              - iam:SetDefaultPolicyVersion
+              - iam:DeletePolicy
+            Resource: "*"
+
+  # A separate principal for the broker in tests: it holds ONLY BrokerPolicy, so the
+  # live tests prove the boundary holds against the broker's real permissions, not an admin's.
+  BrokerTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-broker-test"
+      Description: Assumed by the live tests to act as the broker with least privilege.
+      MaxSessionDuration: 3600
+      ManagedPolicyArns: [!Ref BrokerPolicy]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !Ref BrokerPrincipalArn}
+            Action: ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]
+
+  # An agent identity for the IAM-auth tests. It has no permissions at all; it only
+  # signs sts:GetCallerIdentity, which needs none.
+  AgentTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-agent-test"
+      Description: Stand-in for an agent's workload role (ECS task role, Lambda role).
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !Ref BrokerPrincipalArn}
+            Action: ["sts:AssumeRole"]
 
 Outputs:
   CeilingRoleArn: {Value: !GetAtt CeilingRole.Arn}
+  BoundaryArn: {Value: !Ref CeilingBoundary}
+  BrokerTestRoleArn: {Value: !GetAtt BrokerTestRole.Arn}
+  AgentTestRoleArn: {Value: !GetAtt AgentTestRole.Arn}
   DemoBucketName: {Value: !Ref DemoBucket}
   BrokerPolicyArn: {Value: !Ref BrokerPolicy}

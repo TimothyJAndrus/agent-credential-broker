@@ -17,7 +17,7 @@ Two backends:
 | Backend | The agent gets | Enforced by | Revocation |
 |---|---|---|---|
 | `jwt` | Ed25519-signed token, scope + expiry in the claims | Your resource server (`/v1/introspect` or JWKS) | Immediate (introspection checks grant state) |
-| `sts` | Real AWS credentials from `AssumeRole` with a **per-grant session policy** | AWS IAM | Within seconds: a tag-matched `Deny` pushed onto the role (measured 8.9 s) |
+| `sts` | Real AWS credentials from `AssumeRole` with a **per-grant session policy** | AWS IAM | A tag-matched `Deny` pushed onto the role, then **confirmed** by a canary session (measured 8.6–55 s) |
 
 ## What it refuses (the trap suite)
 
@@ -40,35 +40,58 @@ Two backends:
 
 ## The STS backend, proven against real AWS
 
-`infra/sts-backend.yaml` creates a **ceiling role**: the most any agent credential can ever do. For each grant the broker calls `AssumeRole` with a session policy for exactly that scope. AWS grants the **intersection**, so:
+`infra/sts-backend.yaml` creates a **ceiling role**: the most any agent credential can ever do. For each grant the broker calls `AssumeRole` with a session policy for exactly that scope. AWS grants the **intersection**, so a bug that builds too broad a session policy still can't exceed the role.
 
-- a bug that builds too broad a session policy still can't exceed the role, and
-- a broad role still yields a credential for one prefix.
+The ceiling role also has a **permissions boundary** equal to the ceiling. The broker must be able to write the role's revocation policy, and IAM can't limit that permission to one policy name, so a compromised broker could write `Allow s3:*`. The boundary makes that harmless, and the broker's own policy explicitly denies touching the boundary, the trust policy, or attached policies.
 
-The role's trust policy only accepts the broker principal, requires `SourceIdentity` (the agent's name, shown on every CloudTrail event), and only allows the session tag keys `acb_grant` / `acb_agent`. `RoleSessionName` is the grant id, so CloudTrail ties every API call to one grant.
+The trust policy only accepts the broker principal, requires `SourceIdentity` (the agent's name, on every CloudTrail event), and allows only the `acb_grant` / `acb_agent` session tags. `RoleSessionName` is the grant id.
 
-`tests/test_aws_live.py` checks this against real IAM:
+`tests/test_aws_live.py` runs as `acb-sts-broker-test`, a role holding **only** the broker's least-privilege policy:
 
-```
-test_session_policy_narrows_and_ceiling_holds  PASSED   feeds/a.json yes, feeds/b.json no; payroll/ denied even with s3://bucket/*
-test_source_identity_and_tags_on_session       PASSED
-test_revocation_kills_issued_credentials       PASSED   revocation took effect after 8.9s
-```
+| Live test | What it proves |
+|---|---|
+| `session_policy_narrows_and_ceiling_holds` | `feeds/a.json` yes, `feeds/b.json` no; `payroll/` denied even for an `s3://bucket/*` grant |
+| `compromised_broker_cannot_escape_the_boundary` | Broker writes `Allow s3:*` on the role (it can). It **can't** remove or swap the boundary, attach `AdministratorAccess`, or rewrite the trust policy. A session with an everything session policy still can't read `payroll/` or delete objects. `iam:SimulatePrincipalPolicy` agrees. |
+| `revocation_is_confirmed_by_canary` | After revoking, the broker mints a canary session carrying the revoked grant's tag and polls until AWS refuses it, then logs `grant.revocation_confirmed` with the seconds it took |
+| `cutoff_fallback_kills_older_sessions_only` | When the revoked list outgrows the inline-policy budget, the broker denies every session issued before now (`aws:TokenIssueTime`). Older credentials die; new ones work. |
+| `agent_authenticates_with_its_iam_role` | Real STS verifies a real signature from `acb-sts-agent-test`; replay, wrong-broker and tampered signatures are refused |
 
-Also checked by hand against the deployed role: `AssumeRole` without `SourceIdentity` → `AccessDenied`; with a foreign tag key (`admin=true`) → `AccessDenied`.
+Also checked by hand: `AssumeRole` without `SourceIdentity`, or with a foreign tag key, is `AccessDenied`.
+
+**A finding worth knowing:** the tag-matched deny blocked `s3:GetObject` within ~9 s but had **not** blocked `s3:GetBucketLocation` after 90 s. The canary probes with an object read (`acb-probe/*`) for that reason. A revocation canary has to exercise the same kind of call the agent makes.
+
+## Agent authentication without shared secrets
+
+| Method | Header | How it's verified |
+|---|---|---|
+| **AWS IAM** (`aws_principals`) | `X-Agent-AWS-Auth` | The agent signs `sts:GetCallerIdentity` with its own role (ECS task, Lambda, EC2) and sends the **signed headers**, not credentials. The broker forwards it to STS (the broker picks the URL) and learns the ARN from AWS. The signature must cover `X-ACB-Server-ID`, must be under 5 minutes old, and is accepted once. Same pattern as Vault's IAM auth. |
+| **OIDC** (`oidc`) | `Authorization: Bearer` | Issuer's JWKS, `iss`, `aud`, `exp`, exact `sub` (no wildcards), single-use `jti` |
+| API key (`key_sha256`) | `X-Agent-Key` | Local development. Omit it in production. |
+
+Client side, for IAM: `acb.auth.sign_identity_request(boto3.Session(), "acb-prod")`.
+
+## Several broker instances
+
+Set `ACB_DATABASE_URL=postgresql://...` and run as many instances as you like:
+
+- **Exactly-once pickup across instances.** Every state change is `UPDATE ... WHERE state = ?`. The test has 3 instances race on 10 approved grants (30 concurrent pickups): every grant is issued once, with two `409`s.
+- **One audit chain.** Writers serialize with a transaction-level advisory lock. 60 concurrent requests across 3 instances produce 120 chained records that verify; tampering with one row in SQL is detected.
+- **Revocation edits are serialized** with an advisory lock, so two instances can't overwrite each other's deny list.
+- **Replay protection is shared.** Signature and OIDC `jti` nonces live in the database.
 
 ## Run it
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements-dev.txt
-pytest                                  # 38 unit + trap tests; live AWS tests skip
+docker run -d -p 127.0.0.1:5434:5432 -e POSTGRES_USER=acb -e POSTGRES_PASSWORD=acb postgres:17-alpine
+ACB_TEST_DATABASE_URL=postgresql://acb:acb@127.0.0.1:5434/acb pytest   # 60 tests; live AWS ones skip
 python scripts/demo.py                  # the whole story in one terminal, JWT only
 
 # STS backend against your own account
 aws cloudformation deploy --stack-name acb-sts --template-file infra/sts-backend.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides BrokerPrincipalArn=$(aws sts get-caller-identity --query Arn --output text)
-ACB_AWS_TESTS=1 pytest tests/test_aws_live.py -s
+ACB_AWS_TESTS=1 pytest tests/test_aws_live.py -s     # 5 live tests, ~1-2 min
 python scripts/demo.py --aws            # real credentials, real AccessDenied, real revocation
 
 # As a service
@@ -91,18 +114,27 @@ See [`policy.example.yaml`](policy.example.yaml). Default deny. Only key hashes 
 
 ## Known limits (honest list)
 
-- **STS revocation is not instant.** IAM propagation took 8.9 s in testing; the 900 s minimum session is the second line of defence.
-- **The broker's IAM permission to write the revocation policy can't be narrowed to that policy name** (IAM has no condition key for it). A compromised broker could add an `Allow` to the ceiling role. Next step: a permissions boundary on the ceiling role.
-- **Single process.** SQLite with compare-and-set transitions; one instance at a time. Postgres and a multi-instance deploy are next.
-- **API keys for agents.** Workload identity (OIDC / IAM-signed requests) for agent authentication is on the roadmap.
-- **S3 only, three actions.** More resource types come by adding a scope grammar and a session-policy builder per type.
+v0.1 listed five limits. Status:
+
+| v0.1 limit | v0.2 |
+|---|---|
+| Broker's IAM permission could add an `Allow` to the ceiling role | **Fixed.** Permissions boundary + explicit denies on the broker; proven live with the broker's own credentials |
+| STS revocation not instant | **Narrowed, not eliminated.** IAM propagation is AWS's, not ours: measured 8.6–55 s. The broker now *confirms* each revocation with a canary and records the time, has a `TokenIssueTime` fallback when the list is too big, and the 900 s maximum lifetime remains the backstop. |
+| Single process | **Fixed.** PostgreSQL store, shared audit chain, and advisory locks; proven with 3 racing instances |
+| API keys for agents | **Fixed.** AWS IAM and OIDC auth; API keys are optional and for development |
+| S3 only, three actions | **Still true.** Adding a resource type means adding a scope grammar and a session-policy builder. Next. |
+
+What's still open:
+
+- **Revocation latency is a property of IAM.** If seconds matter, keep TTLs at the 900 s minimum and use the JWT backend, where revocation is immediate, for your own services.
+- **The audit chain proves order and integrity, not that nothing was withheld.** Export the head hash (`/healthz`) to an append-only store (CloudWatch, S3 Object Lock) to close that.
+- **Approvers still use API keys.** Signed, single-use approval links over Slack/Telegram are on the roadmap.
 
 ## Roadmap
 
-1. Permissions boundary on the ceiling role; revocation policy size management (cap + rotation).
-2. Agent auth via OIDC / AWS SigV4 instead of API keys.
+1. More resource types (DynamoDB items, Secrets Manager secrets, Bedrock model invocations).
+2. Approvals over Slack/Telegram with signed, single-use links; approver SSO.
 3. MCP server so an agent framework can request grants as a tool.
-4. Approvals over Slack/Telegram with signed, single-use links.
-5. Postgres store; container + ECS deploy.
+4. Audit head export to S3 Object Lock; container image + ECS deploy.
 
 MIT licensed.

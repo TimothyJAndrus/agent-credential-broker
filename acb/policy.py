@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
+from .auth import OidcRule
 from .scope import Scope, ScopeError, parse
 
 DECISIONS = ("allow", "approve", "deny")
@@ -52,6 +54,10 @@ class Policy:
     approvers: dict[str, Principal]
     sts_role_arn: str | None = None
     sts_region: str = "us-west-2"
+    sts_probe_bucket: str | None = None
+    server_id: str = "agent-credential-broker"
+    aws_principals: dict[str, str] = field(default_factory=dict)  # normalized IAM ARN -> agent
+    oidc_rules: list[tuple[str, OidcRule]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     def authenticate(self, api_key: str, kind: str) -> str | None:
@@ -59,9 +65,12 @@ class Policy:
         digest = hashlib.sha256(api_key.encode()).hexdigest()
         table = self.agent_keys if kind == "agent" else self.approvers
         for p in table.values():
-            if hmac.compare_digest(p.key_sha256, digest):
+            if p.key_sha256 and hmac.compare_digest(p.key_sha256, digest):
                 return p.name
         return None
+
+    def agent_for_arn(self, arn: str) -> str | None:
+        return self.aws_principals.get(arn)
 
 
 @dataclass(frozen=True)
@@ -90,8 +99,10 @@ def evaluate(policy: Policy, agent: str, scope: Scope, requested_ttl: int) -> De
     return Decision(strictest.decision, ttl, backends.pop(), f"matched {len(matches)} rule(s)")
 
 
-def _principal(name: str, raw: dict, where: str) -> Principal:
+def _principal(name: str, raw: dict, where: str, required: bool = True) -> Principal:
     key = (raw or {}).get("key_sha256", "")
+    if not key and not required:
+        return Principal(name, "")
     if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
         raise PolicyError(f"{where} {name}: key_sha256 must be 64 lowercase hex chars")
     return Principal(name, key)
@@ -112,13 +123,40 @@ def load(path: str | Path) -> Policy:
         approvers={},
         sts_role_arn=sts.get("role_arn"),
         sts_region=sts.get("region", "us-west-2"),
+        sts_probe_bucket=sts.get("probe_bucket"),
+        server_id=str(doc.get("server_id", "agent-credential-broker")),
     )
     for name, raw in (doc.get("approvers") or {}).items():
         policy.approvers[name] = _principal(name, raw, "approver")
     for name, raw in (doc.get("agents") or {}).items():
         if name in policy.approvers:
             raise PolicyError(f"{name} cannot be both an agent and an approver")
-        policy.agent_keys[name] = _principal(name, raw, "agent")
+        raw = raw or {}
+        policy.agent_keys[name] = _principal(name, raw, "agent", required=False)
+        methods = 1 if raw.get("key_sha256") else 0
+        for arn in raw.get("aws_principals") or []:
+            if not re.fullmatch(r"arn:aws:iam::\d{12}:(role|user)/[\w+=,.@-]+", arn):
+                raise PolicyError(
+                    f"agents.{name}.aws_principals: {arn!r} must be a role or user ARN "
+                    "without a path (assumed-role sessions drop the path)"
+                )
+            if arn in policy.aws_principals:
+                raise PolicyError(f"{arn} is mapped to two agents")
+            policy.aws_principals[arn] = name
+            methods += 1
+        for o in raw.get("oidc") or []:
+            try:
+                rule = OidcRule(issuer=o["issuer"], audience=o["audience"], subject=o["subject"])
+            except (KeyError, TypeError) as e:
+                raise PolicyError(f"agents.{name}.oidc: needs issuer, audience and subject") from e
+            if not rule.issuer.startswith("https://"):
+                raise PolicyError(f"agents.{name}.oidc: issuer must be https")
+            if "*" in rule.subject:
+                raise PolicyError(f"agents.{name}.oidc: subject must be exact, no wildcards")
+            policy.oidc_rules.append((name, rule))
+            methods += 1
+        if methods == 0:
+            raise PolicyError(f"agent {name} has no way to authenticate (key_sha256, aws_principals or oidc)")
         rules = []
         for i, r in enumerate(raw.get("rules") or []):
             where = f"agents.{name}.rules[{i}]"
