@@ -69,6 +69,11 @@ class FakeSts:
 
     def sync_revocations(self, ids):
         self.revoked = list(ids)
+        return {"mode": "list", "count": len(ids)}
+
+    def confirm_revoked(self, grant_id, agent):
+        self.confirmed = grant_id
+        return 7.5
 
 
 @pytest.fixture
@@ -81,7 +86,7 @@ def env(tmp_path):
     sts = FakeSts()
     audit = AuditLog(tmp_path / "audit.jsonl", clock=clock)
     store = Store(":memory:", clock=clock)
-    app = create_app(policy, store, audit, jb, sts, clock=clock, approval_window=900)
+    app = create_app(policy, store, audit, jb, sts, clock=clock, approval_window=900, run_async=lambda fn: fn())
 
     class Env:
         pass

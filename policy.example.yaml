@@ -4,15 +4,26 @@
 version: 1
 max_ttl_seconds: 3600            # global ceiling; rules can only lower it
 
+server_id: acb-prod              # agents' IAM signatures must name this broker (stops cross-broker replay)
+
 sts:                             # optional; needed only for rules with backend: sts
   role_arn: arn:aws:iam::123456789012:role/acb-sts-ceiling
   region: us-west-2
+  probe_bucket: acme-live        # revocation canary reads acme-live/acb-probe/* to confirm a deny landed
 
 approvers:
   tim: {key_sha256: 2fd89efd7e2cd87f7f5df2038bf200b0f66e1dd460172a80283b38ada74c25fc}
 
 agents:
   support-bot:
+    # Production: the agent proves its IAM role; no secret is shared with the broker.
+    aws_principals: [arn:aws:iam::123456789012:role/support-bot-task]
+    # Or a workload identity token (exact subject; no wildcards):
+    oidc:
+      - issuer: https://token.actions.githubusercontent.com
+        audience: acb-prod
+        subject: repo:acme/support-bot:ref:refs/heads/main
+    # Local development only. Remove in production.
     key_sha256: 8cfbbed0d818a803eddf3db2193bd492460b2db9999d03775a023dd8f90d04a6
     rules:
       # Read the knowledge base on its own, 10 minutes at a time.

@@ -5,6 +5,18 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: acb
+          POSTGRES_PASSWORD: acb
+          POSTGRES_DB: acb
+        ports: ["5434:5432"]
+        options: >-
+          --health-cmd "pg_isready -U acb" --health-interval 2s --health-timeout 3s --health-retries 20
+    env:
+      ACB_TEST_DATABASE_URL: postgresql://acb:acb@localhost:5434/acb
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -13,7 +25,7 @@ jobs:
       - run: pip install -r requirements-dev.txt cfn-lint
       - run: ruff check .
       - run: ruff format --check .
-      - name: Unit + trap evals (live AWS tests skip without ACB_AWS_TESTS=1)
+      - name: Unit, trap, auth and multi-instance Postgres tests (live AWS tests skip without ACB_AWS_TESTS=1)
         run: pytest -v
       - run: python -m acb.cli check-policy policy.example.yaml
       - run: cfn-lint infra/sts-backend.yaml

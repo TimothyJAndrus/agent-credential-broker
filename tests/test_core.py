@@ -104,7 +104,7 @@ def test_session_policies_are_exactly_scoped():
 
 
 def test_revocation_policy_denies_tagged_sessions():
-    doc = revocation_policy("acb-ceiling", ["g-2", "g-1"])
+    doc = revocation_policy(["g-2", "g-1"])
     st = doc["Statement"][0]
     assert st["Effect"] == "Deny" and st["Action"] == "*"
     assert st["Condition"]["StringEquals"]["aws:PrincipalTag/acb_grant"] == ["g-1", "g-2"]
@@ -131,3 +131,26 @@ def test_audit_chain_detects_edit_delete_reorder(tmp_path):
 
     path.write_text("\n".join([lines[1], lines[0]] + lines[2:]) + "\n")
     assert not AuditLog(path).verify()[0]
+
+
+def test_revocation_list_falls_back_to_cutoff_when_too_big():
+    from datetime import UTC, datetime
+
+    from acb.backends.sts_backend import REVOCATION_BUDGET_CHARS, fit_revocations
+
+    now = datetime(2026, 11, 5, 16, 0, 0, tzinfo=UTC)
+    doc, cut = fit_revocations([f"g-{i:024x}" for i in range(10)], now)
+    assert not cut and len(doc["Statement"][0]["Condition"]["StringEquals"]["aws:PrincipalTag/acb_grant"]) == 10
+    many = [f"g-{i:024x}" for i in range(400)]
+    doc, cut = fit_revocations(many, now)
+    assert cut
+    assert doc["Statement"] == [
+        {
+            "Sid": "AcbRevokeAllBefore",
+            "Effect": "Deny",
+            "Action": "*",
+            "Resource": "*",
+            "Condition": {"DateLessThan": {"aws:TokenIssueTime": "2026-11-05T16:00:00Z"}},
+        }
+    ]
+    assert len(json.dumps(doc)) < REVOCATION_BUDGET_CHARS

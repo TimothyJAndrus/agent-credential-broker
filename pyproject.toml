@@ -1,6 +1,6 @@
 [project]
 name = "agent-credential-broker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Short-lived, scoped credentials for AI agents: policy, human approval, tamper-evident audit, JWT and AWS STS backends."
 requires-python = ">=3.12"
 license = "MIT"

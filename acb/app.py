@@ -1,13 +1,18 @@
 """HTTP API.
 
-Agents authenticate with X-Agent-Key, approvers with X-Approver-Key. The two
-key tables are disjoint, so no credential can both ask and approve.
+Agents authenticate with one of:
+  X-Agent-AWS-Auth: <signed sts:GetCallerIdentity>   (IAM role / user; no secret leaves the agent)
+  Authorization: Bearer <OIDC token>                  (workload identity)
+  X-Agent-Key: <api key>                              (local development)
+Approvers authenticate with X-Approver-Key. Agent and approver identities are
+disjoint, so no credential can both ask and approve.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -17,12 +22,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .audit import AuditLog
+from .audit import AuditLog, PostgresAuditLog
+from .auth import AuthError, AwsIamVerifier, OidcVerifier
 from .backends.jwt_backend import JwtBackend
 from .backends.sts_backend import StsBackend
 from .policy import Policy, evaluate, load
 from .scope import ScopeError, parse
-from .store import Store
+from .store import PostgresStore, SqliteStore, open_store
 
 log = logging.getLogger("acb")
 
@@ -44,18 +50,43 @@ class IntrospectBody(BaseModel):
 
 def create_app(
     policy: Policy,
-    store: Store,
-    audit: AuditLog,
+    store: SqliteStore | PostgresStore,
+    audit: AuditLog | PostgresAuditLog,
     jwt_backend: JwtBackend,
     sts_backend: StsBackend | None = None,
     clock=time.time,
     approval_window: int = 900,
+    aws_verifier: AwsIamVerifier | None = None,
+    oidc_verifier: OidcVerifier | None = None,
+    confirm_revocations: bool = True,
+    run_async=None,
 ) -> FastAPI:
     app = FastAPI(title="Agent Credential Broker", version=__version__)
     for w in policy.warnings:
         log.warning("policy: %s", w)
+    run_async = run_async or (lambda fn: threading.Thread(target=fn, daemon=True).start())
 
-    def agent(x_agent_key: str = Header(default="")) -> str:
+    def agent(
+        x_agent_key: str = Header(default=""),
+        x_agent_aws_auth: str = Header(default=""),
+        authorization: str = Header(default=""),
+    ) -> str:
+        try:
+            if x_agent_aws_auth:
+                if aws_verifier is None:
+                    raise AuthError("AWS IAM auth is not enabled on this broker")
+                arn = aws_verifier.verify(x_agent_aws_auth)
+                name = policy.agent_for_arn(arn)
+                if not name:
+                    raise AuthError(f"{arn} is not mapped to an agent")
+                return name
+            if authorization.lower().startswith("bearer "):
+                if oidc_verifier is None or not policy.oidc_rules:
+                    raise AuthError("OIDC auth is not enabled on this broker")
+                return oidc_verifier.verify(authorization[7:].strip(), policy.oidc_rules)
+        except AuthError as e:
+            audit.write("auth.failed", reason=str(e))
+            raise HTTPException(401, str(e)) from e
         name = policy.authenticate(x_agent_key, "agent") if x_agent_key else None
         if not name:
             raise HTTPException(401, "unknown agent key")
@@ -186,16 +217,33 @@ def create_app(
             raise HTTPException(409, f"grant is already {frm}")
         if not store.transition(g.id, frm, "revoked", decided_by=who):
             raise HTTPException(409, "grant changed state; retry")
-        pushed = None
+        pushed, mode = None, None
         if frm == "issued" and g.backend == "sts":
+            sts = backend_for("sts")
             try:
-                backend_for("sts").sync_revocations(store.revoked_unexpired("sts"))
+                # Read-modify-write of one IAM document: serialize across broker instances.
+                with store.lock("acb-sts-revocations"):
+                    mode = sts.sync_revocations(store.revoked_unexpired("sts"))["mode"]
                 pushed = True
             except Exception:
                 log.exception("STS revocation sync failed")
                 pushed = False
-        audit.write("grant.revoked", grant=g.id, agent=g.agent, by=who, was=frm, sts_deny_pushed=pushed)
-        return {"grant": view(store.get(g.id)), "sts_deny_pushed": pushed}
+        audit.write("grant.revoked", grant=g.id, agent=g.agent, by=who, was=frm, sts_deny_pushed=pushed, sts_mode=mode)
+        if pushed and confirm_revocations:
+
+            def confirm(gid=g.id, agent_name=g.agent):
+                try:
+                    took = sts.confirm_revoked(gid, agent_name)
+                except Exception as e:  # noqa: BLE001 (record any failure in the audit log)
+                    audit.write("grant.revocation_unconfirmed", grant=gid, error=type(e).__name__)
+                    return
+                if took is None:
+                    audit.write("grant.revocation_unconfirmed", grant=gid, reason="timeout or no probe bucket")
+                else:
+                    audit.write("grant.revocation_confirmed", grant=gid, seconds=round(took, 1))
+
+            run_async(confirm)
+        return {"grant": view(store.get(g.id)), "sts_deny_pushed": pushed, "sts_mode": mode}
 
     @app.get("/v1/approvals")
     def approvals(who: str = Depends(approver)):
@@ -254,28 +302,45 @@ def create_app(
 
 
 def app_from_env() -> FastAPI:
-    """uvicorn entrypoint: ``uvicorn acb.app:app_from_env --factory``."""
+    """uvicorn entrypoint: ``uvicorn acb.app:app_from_env --factory``.
+
+    ACB_DATABASE_URL=postgresql://... runs the multi-instance store and audit chain;
+    otherwise SQLite and a JSONL audit file under ACB_DATA_DIR (one process only).
+    """
     logging.basicConfig(level=os.environ.get("ACB_LOG_LEVEL", "INFO"))
     policy = load(os.environ.get("ACB_POLICY", "policy.yaml"))
     data = Path(os.environ.get("ACB_DATA_DIR", "data"))
     data.mkdir(parents=True, exist_ok=True)
+    db_url = os.environ.get("ACB_DATABASE_URL", "")
     key_path = os.environ.get("ACB_SIGNING_KEY")
     if key_path:
         jb = JwtBackend.from_pem(Path(key_path).read_bytes())
     else:
         log.warning("ACB_SIGNING_KEY not set: using an ephemeral key; tokens die with the process")
         jb = JwtBackend.generate()
+    store = open_store(db_url) if db_url else SqliteStore(str(data / "grants.db"))
+    audit = PostgresAuditLog(store.pool) if isinstance(store, PostgresStore) else AuditLog(data / "audit.jsonl")
     sts = None
     if policy.sts_role_arn:
         import boto3
 
         session = boto3.Session(region_name=policy.sts_region)
-        sts = StsBackend(policy.sts_role_arn, session.client("sts"), session.client("iam"))
+        sts = StsBackend(
+            policy.sts_role_arn, session.client("sts"), session.client("iam"), probe_bucket=policy.sts_probe_bucket
+        )
+    aws_v = (
+        AwsIamVerifier(policy.server_id, regions=(policy.sts_region,), use_nonce=store.use_nonce)
+        if policy.aws_principals
+        else None
+    )
+    oidc_v = OidcVerifier(use_nonce=store.use_nonce) if policy.oidc_rules else None
     return create_app(
         policy,
-        Store(str(data / "grants.db")),
-        AuditLog(data / "audit.jsonl"),
+        store,
+        audit,
         jb,
         sts,
         approval_window=int(os.environ.get("ACB_APPROVAL_WINDOW", "900")),
+        aws_verifier=aws_v,
+        oidc_verifier=oidc_v,
     )

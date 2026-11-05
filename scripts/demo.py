@@ -65,6 +65,7 @@ def main() -> int:
             out["CeilingRoleArn"],
             boto3.client("sts", region_name=args.region),
             boto3.client("iam", region_name=args.region),
+            probe_bucket=bucket,
         )
         sts_block = f"sts: {{role_arn: {out['CeilingRoleArn']}, region: {args.region}}}"
         sts_rule = (
@@ -90,7 +91,12 @@ def main() -> int:
     )
     audit = AuditLog(tmp / "audit.jsonl")
     app = create_app(
-        load(tmp / "policy.yaml"), Store(str(tmp / "grants.db")), audit, JwtBackend.generate(), sts_backend
+        load(tmp / "policy.yaml"),
+        Store(str(tmp / "grants.db")),
+        audit,
+        JwtBackend.generate(),
+        sts_backend,
+        run_async=lambda fn: fn(),  # run the revocation canary inline so the demo can show its result
     )
     c = TestClient(app)
     a, h = {"X-Agent-Key": AGENT}, {"X-Approver-Key": HUMAN}
@@ -159,13 +165,15 @@ def main() -> int:
         n += 1
         step(n, "Tim revokes it. STS can't recall credentials, so the broker pushes a tag-matched deny onto the role")
         show(c.post(f"/v1/approvals/{b['grant']['id']}/revoke", headers=h))
+        conf = [r for r in audit.records() if r["event"].startswith("grant.revocation_")][-1]
+        print(f"    broker's canary session: {conf['event']} after {conf.get('seconds')}s")
         t0 = time.time()
         while time.time() - t0 < 60:
             try:
                 s3.get_object(Bucket=bucket, Key="feeds/today.json")
                 time.sleep(2)
             except ClientError as e:
-                print(f"    same credentials, {time.time() - t0:.0f}s later: {e.response['Error']['Code']}")
+                print(f"    the agent's own credentials now: {e.response['Error']['Code']}")
                 break
         sts_backend.sync_revocations([])
         n += 1
