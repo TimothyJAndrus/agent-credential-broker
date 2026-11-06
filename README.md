@@ -19,6 +19,15 @@ Two backends:
 | `jwt` | Ed25519-signed token, scope + expiry in the claims | Your resource server (`/v1/introspect` or JWKS) | Immediate (introspection checks grant state) |
 | `sts` | Real AWS credentials from `AssumeRole` with a **per-grant session policy** | AWS IAM | A tag-matched `Deny` pushed onto the role, then **confirmed** by a canary session (measured 8.6–55 s) |
 
+Part of the **trusted-agent stack**, four small open-source pieces for running AI agents a company can trust:
+
+| | Question it answers |
+|---|---|
+| **agent-credential-broker** | What can the agent **access**? Short-lived, scoped credentials. |
+| [agent-guardrails](https://github.com/TimothyJAndrus/agent-guardrails) | What can the agent **do**, and who approved it? Policy and human approval on every tool call. |
+| [agent-trap-evals](https://github.com/TimothyJAndrus/agent-trap-evals) | Is the agent's output **true**? Traps a shallow check passes and a deeper check fails. |
+| [note-taking-service](https://github.com/TimothyJAndrus/note-taking-service) | A real app using them: cited Q&A over team notes, and an MCP server behind the gate. |
+
 ## What it refuses (the trap suite)
 
 `tests/test_traps.py` is written as attacks. Each one must fail safely and leave an audit line:
